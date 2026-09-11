@@ -214,4 +214,10 @@ Flagged here because they'd otherwise bite during setup:
 
 ## 4. Upstream fork review — `uhrichsam4/gods-eye-view`
 
-_See STATUS.md for the reviewed findings and the merge recommendation._
+Reviewed in full. **Recommendation: PARTIAL MERGE** — roughly 2,100 lines of 83,055.
+The headline: that fork hit the identical dev-only-proxy bug and diagnosed it in the
+same words, which is independent confirmation that §0 above is real. Their fix edits
+`vite.config.js`; ours does not, so we already have the capability and do not need
+their hosting code. Their production cache headers were adopted (see §1).
+
+Full findings, the camera-pack licensing caveat, and what to skip: **[STATUS.md](STATUS.md)**.
