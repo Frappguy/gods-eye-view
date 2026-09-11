@@ -61,6 +61,71 @@ const BRIDGEABLE = /-(proxy|proxies)$/;
  * `configurePreviewServer` are skipped so their middleware is not mounted
  * twice.
  */
+/**
+ * Response headers and endpoint denials, registered ahead of every proxy.
+ *
+ * This MUST be `enforce: 'pre'`. Connect runs middleware in registration
+ * order, and a proxy that answers a request never calls `next()`. A hook that
+ * ran last would therefore cover only the routes registered inside it — the
+ * bridged proxies and the static handler — and would silently miss every
+ * proxy that registers its own preview hook (radio, ais-live, openai-realtime,
+ * google-places, weather, regional-brief, military-installations). Observed
+ * exactly that way before this was split out: /api/cctv/sources carried the
+ * framing headers and /api/radio/stations did not.
+ */
+const apiGuard = () => ({
+  name: 'gev-production-api-guard',
+  enforce: 'pre',
+  configurePreviewServer(server) {
+    server.middlewares.use((req, res, next) => {
+      const pathname = (req.url || '/').split('?')[0];
+
+      // `/api/realtime/debug-log` appends caller-supplied JSON to
+      // .gev-logs/realtime-conversations.jsonl — up to 8 MB per request, with
+      // no authentication, no rate limit, and no rotation or size ceiling. On
+      // a localhost dev box that is a debugging convenience. On an
+      // internet-reachable host it is an unauthenticated disk-fill against the
+      // log volume, so it is refused here rather than merely discouraged.
+      // 404 rather than 403: a route that does not exist invites no retry.
+      // Set GEV_ENABLE_REALTIME_DEBUG_LOG=1 to opt back in when debugging.
+      if (
+        pathname === '/api/realtime/debug-log'
+        && process.env.GEV_ENABLE_REALTIME_DEBUG_LOG !== '1'
+      ) {
+        res.statusCode = 404;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+
+      // Framing protection for the app document. `vite.config.js` sets these
+      // under `server.headers`, which applies to the dev server only — so a
+      // production deploy built from this repo serves the app unprotected
+      // unless we set them here.
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+
+      // Caching. This matters more than usual because the deployment sits
+      // behind a proxying CDN: without an explicit `no-store`, live feeds
+      // (aircraft positions, vessel positions, camera frames) are exactly
+      // the shape of thing an edge cache will happily serve stale. A handler
+      // that sets its own Cache-Control still wins — `setHeader` later in
+      // the request overwrites this default.
+      if (pathname.startsWith('/api/')) {
+        res.setHeader('Cache-Control', 'no-store');
+      } else if (pathname.startsWith('/assets/') || pathname.startsWith('/cesium/')) {
+        // Content-hashed by the build, so it is safe to cache forever.
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      } else {
+        // index.html and friends carry no hash — revalidate so a redeploy is
+        // picked up instead of being pinned by an edge cache.
+        res.setHeader('Cache-Control', 'no-cache');
+      }
+      next();
+    });
+  },
+});
+
 const apiBridge = () => {
   let resolvedConfig = null;
   return {
@@ -72,34 +137,6 @@ const apiBridge = () => {
       resolvedConfig = config;
     },
     configurePreviewServer(server) {
-      server.middlewares.use((req, res, next) => {
-        // Framing protection for the app document. `vite.config.js` sets these
-        // under `server.headers`, which applies to the dev server only — so a
-        // production deploy built from this repo serves the app unprotected
-        // unless we set them here.
-        res.setHeader('X-Frame-Options', 'DENY');
-        res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
-
-        // Caching. This matters more than usual because the deployment sits
-        // behind a proxying CDN: without an explicit `no-store`, live feeds
-        // (aircraft positions, vessel positions, camera frames) are exactly
-        // the shape of thing an edge cache will happily serve stale. A handler
-        // that sets its own Cache-Control still wins — `setHeader` later in
-        // the request overwrites this default.
-        const pathname = (req.url || '/').split('?')[0];
-        if (pathname.startsWith('/api/')) {
-          res.setHeader('Cache-Control', 'no-store');
-        } else if (pathname.startsWith('/assets/') || pathname.startsWith('/cesium/')) {
-          // Content-hashed by the build, so it is safe to cache forever.
-          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        } else {
-          // index.html and friends carry no hash — revalidate so a redeploy is
-          // picked up instead of being pinned by an edge cache.
-          res.setHeader('Cache-Control', 'no-cache');
-        }
-        next();
-      });
-
       const bridged = [];
       const skipped = [];
       const deferred = [];
@@ -134,7 +171,7 @@ const apiBridge = () => {
 
 const server = await preview({
   configFile: 'vite.config.js',
-  plugins: [apiBridge()],
+  plugins: [apiGuard(), apiBridge()],
   preview: {
     host: HOST,
     port: PORT,
