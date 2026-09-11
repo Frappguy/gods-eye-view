@@ -237,9 +237,16 @@ recommended values (OpenAI 30/min, Google 60/min, TomTom 5000 tiles/day).
 `GOOGLE_MAPS_API_KEY` is used both client-side (browser geocoding) *and* server-side
 (Places `searchNearby`/`searchText`, Street View). Server-side `fetch` sends no
 `Referer`, so the HTTP-referrer restriction normally recommended for a
-client-exposed key **will reject the server proxies**. Referrer restriction protects
-the client uses only; the **API restriction** is what bounds the server ones. Handled
-in `.env.example` and KEYS.md.
+client-exposed key **will reject the server proxies** — a confusing 403 from
+`/api/google/*`. Referrer restriction protects the client uses only; the **API
+restriction** is what bounds the server ones.
+
+So the recommendation in both `.env.example` and KEYS.md is: **Application
+restrictions → None**, API restriction on, tight per-API quotas. The usual
+counter-argument ("the key is in the bundle, anyone can scrape it") is weak here
+because the site sits behind the NPM access list, so the bundle isn't publicly
+fetchable. If you'd rather have the referrer lock, you lose place search and the
+Street View fallback — that tradeoff is spelled out in both files.
 
 ### SSRF: clean
 

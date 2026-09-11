@@ -199,12 +199,15 @@ actually want to talk to the globe.
 
 Flagged here because they'd otherwise bite during setup:
 
-1. **The referrer-restriction advice is self-defeating.** `GOOGLE_MAPS_API_KEY` is
-   used *both* client-side (browser geocoding) and server-side (Places
-   `searchNearby`/`searchText`, Street View static). Server-side `fetch` sends no
-   `Referer` header, so the HTTP-referrer restriction that `.env.example` recommends
-   for this client-exposed key will cause the server proxies to be rejected.
-   Resolution is in `.env.example` and KEYS.md.
+1. **The stock referrer-restriction advice is self-defeating.**
+   `GOOGLE_MAPS_API_KEY` is used *both* client-side (browser geocoding) and
+   server-side (Places `searchNearby`/`searchText`, Street View static).
+   Server-side `fetch` sends no `Referer` header, so the HTTP-referrer
+   restriction normally recommended for a client-exposed key silently rejects
+   exactly the metered server calls you want to keep working — a confusing 403
+   from `/api/google/*`. Both `.env.example` and KEYS.md previously repeated that
+   advice; both now recommend **no application restriction**, plus an API
+   restriction and tight per-API quotas, and say why.
 2. **TomTom's free tier is documented twice, differently** — `.env.example` says
    ~50,000 tile requests/day, `DATA_SOURCES.md` says 200K/month. The shipped default
    `TOMTOM_DAILY_TILE_BUDGET=40000` would exhaust a 200K/month allowance in five

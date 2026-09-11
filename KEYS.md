@@ -223,14 +223,17 @@ Also relevant for a NAS deploy: the server binds to `localhost` by default. `HOS
    - *(optional)* **Street View Static API** (CCTV fallback frames)
 4. **APIs & Services → Credentials → Create credentials → API key.**
 5. Click the new key → rename it `gev-eye-dinoclyde`.
-6. **Application restrictions → Websites → ADD** → `https://eye.dinoclyde.com/*`
+6. **Application restrictions → None.** (Counter-intuitive — see the gotcha below. A
+   Websites/referrer rule would break this app's server-side Places calls.)
 7. **API restrictions → Restrict key** → tick exactly the APIs from step 3.
 8. **Save.** Copy → `GOOGLE_MAPS_API_KEY=...`
 
 **⚠️ Restriction gotcha found in the code.** GEV uses this one key for **both** browser calls and server-side proxy calls. The server proxy (`places.googleapis.com/v1/places:searchNearby` and `:searchText`, and the Street View static fetch) sends **no `Referer` header** — so an HTTP-referrer-restricted key will be **rejected on those server-side calls**. Your options:
-- **Recommended:** apply the referrer restriction anyway (the exposed browser key is the actual leak vector), accept that nearby-places / text-search / Street View fallback degrade to their keyless "not configured" responses, and lean on per-API quotas for the rest.
-- Or: skip the referrer restriction, keep the API restriction, and set **very low daily quotas** (next section) so an abused key costs pennies.
+- **Recommended: leave Application restrictions on None**, keep the API restriction, and set **tight per-API quotas** (next section) so an abused key costs pennies. This keeps place search, voice "what's near here", and the Street View fallback all working. The usual argument for a referrer lock — "the key is in the browser bundle, anyone can scrape it" — is much weaker here, because the site sits behind a reverse-proxy access list, so the bundle is not publicly fetchable in the first place. Quotas plus that access list are doing the real work.
+- Or: apply the referrer restriction and accept that nearby-places / text-search / Street View degrade to their keyless "not configured" responses. Choose this only if you do not care about place search.
 - Or: create a second, unrestricted, *quota-capped* key and swap it in only when you want place search. One env var, so it's manual.
+
+Whichever you pick, `.env.example` carries the same reasoning next to the variable itself.
 
 **Free tier (verify — provider terms drift):** Photorealistic 3D Tiles: the first ~1,000 sessions/month are currently free, and one root request supports roughly three hours of rendering — a solo user exploring sparingly can realistically stay inside it. Geocoding and Places (New) have their own separate monthly free call allowances. Google restructured Maps Platform billing in 2025 (per-API free tiers replaced the old flat $200 credit) — **check https://developers.google.com/maps/billing-and-pricing/pricing before trusting any of this.**
 
