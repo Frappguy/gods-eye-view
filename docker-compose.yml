@@ -1,0 +1,109 @@
+# ===========================================================================
+# God's Eye View — ZimaOS / CasaOS deployment.
+#
+# Reached exclusively through Nginx Proxy Manager, which forwards to this
+# container's STATIC IP on the shared `proxy_net` bridge. See the networks
+# block at the bottom for why there is no `ports:` mapping.
+#
+# Deploy:  docker compose up -d --build
+# Logs:    docker compose logs -f gods-eye-view
+# ===========================================================================
+
+services:
+  gods-eye-view:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # NO `args:` HERE, ON PURPOSE. GOOGLE_MAPS_API_KEY and CESIUM_ION_TOKEN
+      # are compiled into the browser bundle by vite's `define`. Passing them
+      # as build args would bake them into an image layer that travels with
+      # any `docker save` or registry push. Instead the image is generic and
+      # the bundle is built at container start from `env_file` below — see
+      # the Dockerfile header for the full reasoning.
+
+    container_name: gods-eye-view
+    restart: unless-stopped
+
+    # All ~40 provider credentials and tuning knobs. This file is NOT in the
+    # image (.dockerignore excludes it); it is read by the Docker daemon at
+    # `up` time and injected as process.env. vite.config.js's
+    # loadEnv(mode, __dirname, '') uses an empty prefix, so every one of these
+    # reaches both the build and the request-time proxies.
+    env_file: .env
+
+    environment:
+      # These two are set HERE rather than left to .env because .env is shared
+      # with local development, where HOST=localhost is the correct value. In
+      # a container, HOST=localhost binds the server to the container's own
+      # loopback interface: the process starts, the log looks normal, and
+      # Nginx Proxy Manager gets ECONNREFUSED from a container that reports
+      # itself running. Compose `environment:` beats `env_file:`, and
+      # vite.config.js only backfills keys that process.env does not already
+      # define, so these win unconditionally.
+      HOST: "0.0.0.0"
+      PORT: "4173"
+
+    # ---------------------------------------------------------------------
+    # Persistent runtime state. .gev-cache is NOT a disposable cache:
+    # .gev-cache/tomtom/budget.json is the daily TomTom tile-spend counter. If
+    # it is lost on restart the cost guard resets to zero spent, and a restart
+    # loop could quietly buy a second (third, fourth) day of tiles against the
+    # free-tier allowance. Named volumes survive `down`/`up`/`--build`; they
+    # are only removed by an explicit `docker compose down -v`.
+    # .gev-cache also holds the NASA FIRMS response cache and the TomTom tile
+    # cache; .gev-logs holds the server's own log output.
+    # ---------------------------------------------------------------------
+    volumes:
+      - gev-cache:/app/.gev-cache
+      - gev-logs:/app/.gev-logs
+
+    # Probes the app from INSIDE the container. node:24-bookworm-slim ships no
+    # curl and no wget, so this uses node's built-in global fetch() — the one
+    # runtime that is certain to be present. 127.0.0.1 (not the container IP)
+    # so the probe is unaffected by network reconfiguration.
+    # start_period is generous because every start runs a full `vite build`
+    # (Cesium + egm96 are multi-MB chunks): ~7s on a dev box, but budget far
+    # more on NAS-class CPUs. Failures during start_period do not count
+    # against `retries` and do not mark the container unhealthy.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 150s
+
+    # A NAS runs this for months at a time. Vite logs every proxied request,
+    # so unbounded json-file logging is a real route to a full system
+    # partition. 10MB x 5 caps this container at 50MB of logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # NO `ports:` MAPPING — INTENTIONAL, DO NOT ADD ONE.
+    # Nginx Proxy Manager lives on the same `proxy_net` bridge and reaches
+    # this container directly at 172.20.0.10:4173. Publishing a host port
+    # would (a) be redundant, (b) expose the app on the LAN bypassing NPM's
+    # TLS termination and access lists, and (c) collide with a host that
+    # already has 53, 80, 81, 443, 3080, 8080, 9876 and 32400 in use.
+    networks:
+      proxy_net:
+        # Static so the NPM proxy host entry never has to chase a DHCP lease
+        # after a restart. .0.2 is taken by another container on this bridge.
+        ipv4_address: 172.20.0.10
+
+networks:
+  # Pre-existing bridge on the NAS (subnet 172.20.0.0/16), shared with Nginx
+  # Proxy Manager. `external: true` means compose attaches to it and will
+  # never create, reconfigure or (on `down`) delete it.
+  proxy_net:
+    external: true
+
+volumes:
+  gev-cache:
+  gev-logs:

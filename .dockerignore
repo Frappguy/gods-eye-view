@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# God's Eye View — Docker build context filter.
+#
+# The runtime image needs the SOURCE tree, not just a built bundle (see the
+# Dockerfile header): vite.config.js is loaded at request time and imports
+# ./src/** and ./scripts/pinokio-environment.mjs, and reads ./config/*.json
+# per request. So this file is deliberately a denylist of things that are
+# large, regenerated, or secret — never a pruning of "app code we think is
+# only needed at build time".
+# ---------------------------------------------------------------------------
+
+# Reinstalled inside the image by `npm ci`. Host copies are the wrong
+# platform/arch for sharp's prebuilt binaries and would silently poison the
+# container.
+node_modules
+**/node_modules
+
+# Rebuilt at container start from the runtime environment. Copying a host
+# build would ship whatever GOOGLE_MAPS_API_KEY / CESIUM_ION_TOKEN the
+# developer happened to have baked into it — exactly the secret leak the
+# build-at-start design exists to prevent.
+dist
+
+# 84MB of history, zero runtime value.
+.git
+.gitattributes
+.github
+
+# SECRETS. The container receives keys via docker-compose `env_file:` ->
+# process.env, never via an image layer. If .env ever lands in the build
+# context, a `docker save`/registry push would carry every credential.
+.env
+.env.*
+!.env.example
+pinokio/ENVIRONMENT
+pinokio/.installed
+*.pem
+*.crt
+
+# Runtime state. These are bind/named volumes at run time; .gev-cache in
+# particular holds tomtom/budget.json (the daily spend guard) and must come
+# from the volume, not from a stale image layer.
+.gev-cache
+.gev-logs
+
+# Build/QA artifacts and large media (docs/media alone is ~68MB of gifs).
+screenshots
+qa-shots
+output
+docs/media
+3d-models
+.gstack
+*.log
+.DS_Store
+
+# Compose/orchestration files are inputs to the daemon, not to the image.
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
