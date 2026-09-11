@@ -72,11 +72,31 @@ const apiBridge = () => {
       resolvedConfig = config;
     },
     configurePreviewServer(server) {
-      // Framing protection for the app document. `vite.config.js` sets these
-      // under `server.headers`, which applies to the dev server only.
       server.middlewares.use((req, res, next) => {
+        // Framing protection for the app document. `vite.config.js` sets these
+        // under `server.headers`, which applies to the dev server only — so a
+        // production deploy built from this repo serves the app unprotected
+        // unless we set them here.
         res.setHeader('X-Frame-Options', 'DENY');
         res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+
+        // Caching. This matters more than usual because the deployment sits
+        // behind a proxying CDN: without an explicit `no-store`, live feeds
+        // (aircraft positions, vessel positions, camera frames) are exactly
+        // the shape of thing an edge cache will happily serve stale. A handler
+        // that sets its own Cache-Control still wins — `setHeader` later in
+        // the request overwrites this default.
+        const pathname = (req.url || '/').split('?')[0];
+        if (pathname.startsWith('/api/')) {
+          res.setHeader('Cache-Control', 'no-store');
+        } else if (pathname.startsWith('/assets/') || pathname.startsWith('/cesium/')) {
+          // Content-hashed by the build, so it is safe to cache forever.
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        } else {
+          // index.html and friends carry no hash — revalidate so a redeploy is
+          // picked up instead of being pinned by an edge cache.
+          res.setHeader('Cache-Control', 'no-cache');
+        }
         next();
       });
 
