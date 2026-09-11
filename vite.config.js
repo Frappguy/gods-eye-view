@@ -36,6 +36,11 @@ import https from 'node:https';
 import { lookup as lookupDns } from 'node:dns/promises';
 import { directionToHeading } from './src/data/directionText.js';
 import {
+  parseCctvBbox,
+  selectCctvSourcesForView,
+  clampCctvViewportLimit,
+} from './src/data/cctvViewportSelect.js';
+import {
   isValidTileCoord as isValidTomTomTile,
   utcDayKey as tomtomUtcDayKey,
   normalizeBudget as normalizeTomTomBudget,
@@ -4173,6 +4178,362 @@ async function loadTflSourcesFromOpenData() {
 }
 
 /**
+ * Parse an OGC WKT POINT into lat/lon. The 511-family DataTables catalogs
+ * (e.g. 511NY) nest coordinates as `latLng.geography.wellKnownText` =
+ * "POINT (lon lat)" — lon first.
+ *
+ * @param {string} wkt
+ * @returns {{lat:number, lon:number}|null} Null when unparseable.
+ */
+function parseWktPoint(wkt) {
+  const match = /POINT\s*\(\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\)/i.exec(String(wkt || ''));
+  if (!match) return null;
+  const lon = toFiniteNumber(match[1], NaN);
+  const lat = toFiniteNumber(match[2], NaN);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+}
+
+// ---------------------------------------------------------------------------
+// Generic world camera-catalog adapter
+// ---------------------------------------------------------------------------
+/** Declarative registry of third-party camera catalogs (see loadWorldCatalogSources). */
+const DEFAULT_WORLD_CATALOG_FILE = 'config/cctv_catalogs.json';
+/** Per-catalog cap. Generous on purpose: a national road authority routinely
+ * publishes several hundred cameras, and a tighter slice threw most of each catalog
+ * away. The global CCTV_MAX_SOURCES remains the real budget. */
+const DEFAULT_WORLD_MAX_PER_CATALOG = 400;
+/** DataTables-style catalogs hard-cap page size at 100 regardless of what is asked. */
+const WORLD_DATATABLES_PAGE_SIZE = 100;
+/** Backstop against an upstream recordsTotal blow-up. */
+const WORLD_MAX_PAGES = 60;
+
+/**
+ * Minimal XML record extractor for camera catalogs.
+ *
+ * Deliberately not a general XML parser: camera catalogs that ship XML are flat
+ * lists of one record tag whose children are leaf text nodes (Hong Kong's
+ * `<image>`, NZTA's `<camera>`). Parsing exactly that shape avoids taking on an
+ * XML dependency for two sources.
+ *
+ * Handles CDATA and the five predefined entities. Repeated child tags keep the
+ * FIRST occurrence, matching how the JSON catalogs' `.0.` paths behave.
+ *
+ * @param {string} xml - Raw XML document.
+ * @param {string} recordTag - Element name that delimits one camera.
+ * @returns {Array<object>} One flat object per record.
+ */
+function parseXmlRecords(xml, recordTag) {
+  const safeTag = String(recordTag).replace(/[^A-Za-z0-9_:.-]/g, '');
+  if (!safeTag) return [];
+  const records = [];
+  const recordPattern = new RegExp(`<${safeTag}(?:\\s[^>]*)?>([\\s\\S]*?)</${safeTag}>`, 'g');
+  const decode = (raw) => String(raw)
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .trim();
+
+  let match = recordPattern.exec(xml);
+  while (match) {
+    const body = match[1];
+    const record = {};
+    // Flatten nested elements too: Madrid's M-30 feed wraps coordinates as
+    // <Posicion><Latitud>…</Latitud></Posicion>, and a single non-recursive pass
+    // consumes the whole <Posicion> block and never sees Latitud at all.
+    const collect = (fragment) => {
+      const fieldPattern = /<([A-Za-z0-9_:.-]+)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
+      let field = fieldPattern.exec(fragment);
+      while (field) {
+        const [, tag, value] = field;
+        if (/<[A-Za-z]/.test(value)) collect(value);
+        else if (!(tag in record)) record[tag] = decode(value);
+        field = fieldPattern.exec(fragment);
+      }
+    };
+    collect(body);
+    if (Object.keys(record).length) records.push(record);
+    match = recordPattern.exec(xml);
+  }
+  return records;
+}
+
+/**
+ * Read a dotted path out of a record, supporting array indexes.
+ *
+ * "geometry.coordinates.1" → record.geometry.coordinates[1]
+ * "" or null → undefined
+ *
+ * @param {object} source
+ * @param {string|null} path
+ * @returns {*} The value, or undefined if any segment is missing.
+ */
+function pluckPath(source, path) {
+  if (!path) return undefined;
+  let cursor = source;
+  for (const segment of String(path).split('.')) {
+    if (cursor === null || cursor === undefined) return undefined;
+    cursor = cursor[segment];
+  }
+  return cursor;
+}
+
+/**
+ * Substitute {field} placeholders in a URL template from a record.
+ * Values are URI-encoded, so a template is never an injection point.
+ *
+ * @param {string} template - e.g. "https://host/cam/{id}.jpg"
+ * @param {object} record
+ * @param {object} fields - Catalog field map (template keys resolve through it).
+ * @returns {string}
+ */
+function applyUrlTemplate(template, record, fields) {
+  return String(template).replace(/\{(\w+)\}/g, (_match, key) => {
+    const raw = pluckPath(record, fields?.[key] || key);
+    return encodeURIComponent(raw === undefined || raw === null ? '' : String(raw));
+  });
+}
+
+/**
+ * Fetch every row of one catalog, following its pagination mode.
+ *
+ * Supported modes:
+ *   null / absent  — one request, the whole catalog
+ *   'datatables'   — the 511-family POST endpoint, 100 rows/page
+ *
+ * @param {object} catalog - Registry entry.
+ * @returns {Promise<Array<object>>}
+ */
+async function fetchWorldCatalogRows(catalog) {
+  const requestOnce = async (extraBody) => {
+    const init = {
+      method: catalog.method === 'POST' ? 'POST' : 'GET',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+        ...(catalog.headers || {}),
+      },
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    };
+    if (init.method === 'POST') {
+      init.headers['Content-Type'] = catalog.contentType || 'application/x-www-form-urlencoded';
+      init.body = extraBody ?? catalog.body ?? '';
+    }
+    const resp = await fetch(catalog.catalogUrl, init);
+    if (!resp.ok) throw new Error(`${catalog.id} HTTP ${resp.status}`);
+    const text = await resp.text();
+    if (!text.trim()) throw new Error(`${catalog.id} empty body`);
+    if (catalog.format === 'xml') return parseXmlRecords(text, catalog.recordTag || 'item');
+    return JSON.parse(text);
+  };
+
+  const pagination = catalog.pagination;
+  if (!pagination || pagination.mode !== 'datatables') {
+    const payload = await requestOnce();
+    // parseXmlRecords already returns the flat record array, so arrayPath is a
+    // JSON-only concept.
+    const rows = (catalog.format !== 'xml' && catalog.arrayPath)
+      ? pluckPath(payload, catalog.arrayPath)
+      : payload;
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  // DataTables: page 0 first for the total, then the rest sequentially. These
+  // endpoints intermittently answer 200 with an empty body, so each page gets
+  // retries — without them a handful of pages silently drop every refresh.
+  const pageBody = (start) => String(catalog.body || '').replace(/(^|&)start=\d+/, `$1start=${start}`);
+  const fetchPage = async (start) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await requestOnce(pageBody(start));
+      } catch (err) {
+        if (attempt === 2) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      }
+    }
+    return null;
+  };
+
+  const first = await fetchPage(0);
+  const rowsOf = (payload) => {
+    const rows = catalog.arrayPath ? pluckPath(payload, catalog.arrayPath) : payload;
+    return Array.isArray(rows) ? rows : [];
+  };
+  const all = [...rowsOf(first)];
+  const total = toFiniteNumber(pluckPath(first, pagination.totalPath || 'recordsTotal'), all.length);
+  const pageCount = Math.min(Math.ceil(total / WORLD_DATATABLES_PAGE_SIZE) || 1, WORLD_MAX_PAGES);
+  for (let page = 1; page < pageCount; page += 1) {
+    const payload = await fetchPage(page * WORLD_DATATABLES_PAGE_SIZE);
+    all.push(...rowsOf(payload));
+  }
+  return all;
+}
+
+/**
+ * Load every catalog in the world registry and normalize it into camera sources.
+ *
+ * This is the scaling seam for global coverage: a new country is a JSON entry in
+ * config/cctv_catalogs.json (URL + field paths + licence), not a new loader.
+ * Catalogs fail independently, so one dead national road authority never
+ * darkens the rest of the world.
+ *
+ * Env:
+ *   CCTV_WORLD_ENABLED=0            disable the whole pack
+ *   CCTV_WORLD_CATALOGS=de,fi,sg    comma-separated ids/countries to include (default: all)
+ *   CCTV_WORLD_MAX_PER_CATALOG=400  per-catalog cap (clamped 4..900)
+ *   CCTV_WORLD_CATALOG_FILE=...     alternative registry path
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadWorldCatalogSources() {
+  if (String(process.env.CCTV_WORLD_ENABLED || '1').trim() === '0') return [];
+
+  const file = process.env.CCTV_WORLD_CATALOG_FILE || DEFAULT_WORLD_CATALOG_FILE;
+  let registry = [];
+  try {
+    const raw = fs.readFileSync(path.resolve(__dirname, file), 'utf8');
+    registry = JSON.parse(raw);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') console.warn('[CCTV] world catalog registry unreadable:', err?.message || err);
+    return [];
+  }
+  if (!Array.isArray(registry)) return [];
+
+  const only = String(process.env.CCTV_WORLD_CATALOGS || '')
+    .split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const active = registry.filter((c) => {
+    if (!c || c.enabled === false) return false;
+    if (!only.length) return true;
+    return only.includes(String(c.id).toLowerCase()) || only.includes(String(c.country).toLowerCase());
+  });
+  if (!active.length) return [];
+
+  const maxRaw = Number(process.env.CCTV_WORLD_MAX_PER_CATALOG || DEFAULT_WORLD_MAX_PER_CATALOG);
+  const perCatalogMax = Number.isFinite(maxRaw)
+    ? Math.max(4, Math.min(900, Math.floor(maxRaw)))
+    : DEFAULT_WORLD_MAX_PER_CATALOG;
+
+  const settled = await Promise.allSettled(active.map(async (catalog) => {
+    const rows = await fetchWorldCatalogRows(catalog);
+    const fields = catalog.fields || {};
+    const cameras = [];
+
+    for (const row of rows) {
+      // Two coordinate encodings in the wild: discrete lat/lon fields, and a WKT
+      // POINT string (the 511 DataTables family nests one at
+      // latLng.geography.wellKnownText). `fields.wkt` selects the latter.
+      let lat = NaN;
+      let lon = NaN;
+      if (fields.wkt) {
+        const point = parseWktPoint(pluckPath(row, fields.wkt));
+        if (point) {
+          lat = point.lat;
+          lon = point.lon;
+        }
+      } else {
+        lat = toFiniteNumber(pluckPath(row, fields.lat), NaN);
+        lon = toFiniteNumber(pluckPath(row, fields.lon), NaN);
+      }
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      // A catalog that reports 0,0 for unplaced cameras would otherwise drop a
+      // pile of markers into the Gulf of Guinea.
+      if (lat === 0 && lon === 0) continue;
+
+      let imageUrl = '';
+      if (catalog.imageUrlTemplate) {
+        imageUrl = applyUrlTemplate(catalog.imageUrlTemplate, row, fields);
+      } else {
+        const raw = pluckPath(row, fields.imageUrl);
+        if (typeof raw === 'string') imageUrl = raw;
+      }
+      // Several agencies wrap the URL in HTML (Calgary ships
+      // '<a href="...">Camera 38</a>'), so allow a per-catalog extractor.
+      if (imageUrl && catalog.imageUrlRegex) {
+        const match = new RegExp(catalog.imageUrlRegex).exec(imageUrl);
+        imageUrl = match ? (match[1] ?? match[0]) : '';
+      }
+      // Catalogs are untidy about URL hygiene: Greece's NOA feed ships
+      // protocol-relative '//host/cam.jpg' values with a trailing space.
+      imageUrl = imageUrl.trim();
+      if (imageUrl.startsWith('//')) imageUrl = `https:${imageUrl}`;
+      if (!imageUrl) continue;
+      // Relative image paths come in both forms: rooted ('/images/1.jpg', 511NY)
+      // and bare ('94/94_202608250811.jpg', Estonia). Resolve either against
+      // imageBaseUrl — matching only the rooted form silently dropped every
+      // Estonian camera.
+      if (catalog.imageBaseUrl && !/^https?:\/\//i.test(imageUrl)) {
+        const base = String(catalog.imageBaseUrl).replace(/\/+$/, '');
+        imageUrl = `${base}/${imageUrl.replace(/^\/+/, '')}`;
+      }
+      // Oregon's filenames carry raw spaces, which several HTTP clients reject.
+      imageUrl = imageUrl.replace(/ /g, '%20');
+      // Utah and Calgary publish http:// URLs; upgrade so a https page can load
+      // them without mixed-content blocking.
+      if (imageUrl.startsWith('http://')) imageUrl = `https://${imageUrl.slice(7)}`;
+      if (!/^https?:\/\//i.test(imageUrl)) continue;
+      // Some catalogs aggregate several agencies onto one layer and only part of
+      // it is reachable (Illinois mixes cctv.travelmidwest.com with
+      // lakecountypassage.com, which times out). imageUrlPrefix keeps the
+      // dependable subset rather than seeding the map with dead cameras.
+      if (catalog.imageUrlPrefix && !imageUrl.toLowerCase().startsWith(String(catalog.imageUrlPrefix).toLowerCase())) continue;
+
+      const rawId = pluckPath(row, fields.id);
+      const localId = String(rawId ?? `${lat.toFixed(5)},${lon.toFixed(5)}`).trim();
+      if (!localId) continue;
+
+      const heading = directionToHeading(pluckPath(row, fields.heading), true);
+      const hasHeading = Number.isFinite(heading);
+      const elevation = toFiniteNumber(pluckPath(row, fields.elevation), NaN);
+      const cameraId = `${catalog.id}-${localId}`;
+
+      cameras.push({
+        id: cameraId,
+        name: String(pluckPath(row, fields.name) ?? localId).trim() || localId,
+        city: String(catalog.countryName || catalog.country || 'World'),
+        cityId: String(catalog.id),
+        provider: String(catalog.provider || catalog.id),
+        lat,
+        lon,
+        headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+        headingConfidence: hasHeading ? 'high' : 'low',
+        pitchDeg: hasHeading ? -22 : -18,
+        fovDeg: hasHeading ? 56 : 44,
+        rangeM: hasHeading ? 220 : 145,
+        mountHeightM: hasHeading ? 9 : 8,
+        groundElevationM: Number.isFinite(elevation) ? Math.max(-100, Math.min(4000, elevation)) : 50,
+        feedType: 'image',
+        url: imageUrl,
+        snapshotUrl: imageUrl,
+        sourceKind: `world-${catalog.id}`,
+        license: String(catalog.license || 'Licence not published by the operator'),
+      });
+    }
+
+    const anchors = Array.isArray(catalog.anchors) && catalog.anchors.length
+      ? catalog.anchors
+      : [{ lat: cameras[0]?.lat ?? 0, lon: cameras[0]?.lon ?? 0 }];
+    const cap = Number.isFinite(catalog.maxSources)
+      ? Math.max(4, Math.min(perCatalogMax, catalog.maxSources))
+      : perCatalogMax;
+    const prioritized = prioritizeSources(cameras, cap, anchors);
+    console.log(`[CCTV] world/${catalog.id} (${catalog.countryName || catalog.country}): ${cameras.length} usable (using nearest ${prioritized.length})`);
+    return prioritized;
+  }));
+
+  const out = [];
+  for (let i = 0; i < settled.length; i += 1) {
+    const result = settled[i];
+    if (result.status === 'fulfilled') out.push(...result.value);
+    else console.warn(`[CCTV] world/${active[i].id} failed:`, result.reason?.message || result.reason);
+  }
+  console.log(`[CCTV] Loaded world catalog sources: ${out.length} cameras from ${active.length} catalogs`);
+  return out;
+}
+
+/**
  * Normalize a raw CCTV source item into a canonical shape with safe defaults.
  *
  * @param {object} item - Raw source from file, env, or Austin Open Data.
@@ -4243,27 +4604,32 @@ async function refreshCctvSources() {
 
   const forceAustin = String(process.env.CCTV_FORCE_AUSTIN || '').trim() === '1';
   const preferAustin = String(process.env.CCTV_PREFER_AUSTIN || '1').trim() !== '0';
-  // Live open-data packs (Austin + Caltrans + TfL) load unless a file/env pack
-  // is configured and live packs aren't forced — same gate that governed the
-  // Austin-only fetch, now governing all three. Each pack fails independently.
+  // Live open-data packs (Austin + Caltrans + TfL + the world catalog pack) load
+  // unless a file/env pack is configured and live packs aren't forced — same gate
+  // that governed the Austin-only fetch, now governing all four. Each pack fails
+  // independently.
   const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
+  const worldEnabled = String(process.env.CCTV_WORLD_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
+  let fromWorld = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, worldResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
+      worldEnabled ? loadWorldCatalogSources() : Promise.resolve([]),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
+    fromWorld = worldResult.status === 'fulfilled' ? worldResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromWorld, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
@@ -4276,11 +4642,21 @@ async function refreshCctvSources() {
 
   const mergedSources = Array.from(byId.values());
   const maxRaw = Number(process.env.CCTV_MAX_SOURCES || DEFAULT_CCTV_MAX_SOURCES);
-  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(1200, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(20000, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  // Hand-authored file/env cameras are protected from the global cap. They are
+  // last in merge order (so they win ID collisions), which previously made them
+  // the FIRST thing a slice() dropped — a curated, individually-verified camera
+  // being evicted by bulk highway imports is exactly backwards. Keep every
+  // curated entry, then spend the remaining budget on the bulk packs.
+  let capped = mergedSources;
   if (mergedSources.length > maxCount) {
-    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; keeping the first ${maxCount} (raise CCTV_MAX_SOURCES or lower a per-pack cap to change which).`);
+    const curatedIds = new Set([...fromFile, ...fromEnv].map((item) => item?.id).filter(Boolean));
+    const curated = mergedSources.filter((item) => curatedIds.has(item.id));
+    const bulk = mergedSources.filter((item) => !curatedIds.has(item.id));
+    const budget = Math.max(0, maxCount - curated.length);
+    capped = [...bulk.slice(0, budget), ...curated];
+    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; kept all ${curated.length} curated cameras + the first ${budget} bulk (raise CCTV_MAX_SOURCES or lower a per-pack cap to change which).`);
   }
-  const capped = mergedSources.length > maxCount ? mergedSources.slice(0, maxCount) : mergedSources;
   if (capped.length > 0 || _cctvSourceCache.length === 0) {
     _cctvSourceCache = capped;
   } else {
@@ -4605,8 +4981,22 @@ function cctvProxy() {
           const url = new URL(req.url || '/', 'http://localhost');
 
           if (url.pathname === '/sources') {
+            // Viewport-scoped delivery. `bbox` and `limit` are both optional:
+            // a caller that sends neither still gets a usable globe-wide
+            // sample rather than the whole multi-thousand registry, which is
+            // what keeps an old cached client from pulling several megabytes.
+            const bbox = parseCctvBbox(url.searchParams.get('bbox'));
+            const limit = clampCctvViewportLimit(url.searchParams.get('limit'));
+            const { selected, matched } = selectCctvSourcesForView(sources, bbox, limit);
             const body = {
-              sources: sources.map((source) => ({
+              // Counts let the client tell the user "showing 600 of 4,812 in
+              // view" and decide whether zooming in would reveal more.
+              total: sources.length,
+              matched,
+              returned: selected.length,
+              truncated: selected.length < matched,
+              scope: bbox ? 'viewport' : 'global-sample',
+              sources: selected.map((source) => ({
                 id: source.id,
                 name: source.name,
                 city: source.city,
