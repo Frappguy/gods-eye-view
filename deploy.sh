@@ -17,7 +17,11 @@ set -euo pipefail
 
 # ─── configuration (env-overridable) ──────────────────────────────────────────
 REPO_URL="${GEV_REPO_URL:-https://github.com/Frappguy/gods-eye-view}"
-BRANCH="${GEV_BRANCH:-claude/gods-eye-view-nas-deploy-69coji}"
+# Deploy from main. This tracked the feature branch while the deployment work
+# was unmerged; that branch is now merged and frozen at the pre-CCTV commit, so
+# leaving it as the default silently re-deployed stale code on every re-run —
+# the script reported success having changed nothing.
+BRANCH="${GEV_BRANCH:-main}"
 DEPLOY_DIR="${GEV_DEPLOY_DIR:-/DATA/AppData/gods-eye-view}"
 CONTAINER_NAME="${GEV_CONTAINER:-gods-eye-view}"
 NETWORK="${GEV_NETWORK:-proxy_net}"
@@ -118,6 +122,26 @@ gev_next_free_ip() {
 # shellcheck disable=SC2317  # the `exit` IS reached when run (not sourced)
 if [ -n "${GEV_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
 
+# ─── 0. docker config dir ─────────────────────────────────────────────────────
+# ZimaOS mounts / (and so /root) read-only. The docker CLI and compose want to
+# create ~/.docker for their config, and when they cannot, `compose up` dies
+# with "mkdir /root/.docker: read-only file system" BEFORE it builds anything —
+# which reads like a build failure but is not one. `docker info` still works,
+# so preflight passes and the error only surfaces at step 6.
+# Point DOCKER_CONFIG at the first writable candidate. An operator-supplied
+# DOCKER_CONFIG is always respected as-is.
+if [ -z "${DOCKER_CONFIG:-}" ]; then
+  for _candidate in "${HOME:-/root}/.docker" "$(dirname "$DEPLOY_DIR")/.gev-docker" "/tmp/.gev-docker"; do
+    if mkdir -p "$_candidate" 2>/dev/null && [ -w "$_candidate" ]; then
+      if [ "$_candidate" != "${HOME:-/root}/.docker" ]; then
+        export DOCKER_CONFIG="$_candidate"
+      fi
+      break
+    fi
+  done
+  unset _candidate
+fi
+
 # ─── 1. preflight ─────────────────────────────────────────────────────────────
 step "1/8  Preflight"
 command -v docker >/dev/null 2>&1 || die "docker not found in PATH. This script expects ZimaOS with Docker installed."
@@ -132,6 +156,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 [ "$(id -u)" -eq 0 ] || log "running as $(id -un) (not root) — docker socket is reachable, continuing"
 ok "docker daemon responding"
+[ -n "${DOCKER_CONFIG:-}" ] && log "DOCKER_CONFIG=$DOCKER_CONFIG (default ~/.docker is not writable on this host)"
 
 COMPOSE=()
 if docker compose version >/dev/null 2>&1; then
