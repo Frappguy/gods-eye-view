@@ -176,6 +176,40 @@ const PROBE_MIN_RANGE_M = 12;
 // so past this budget init proceeds on catalog fallbacks and the batch applies
 // post-hoc (applyLateGroundPriors) when it lands.
 const GROUND_PRIOR_INIT_WAIT_MS = 8000;
+
+// ---------------------------------------------------------------------------
+// Viewport-scoped catalog growth (2026-09 world-registry change)
+//
+// /api/cctv/sources no longer ships the whole registry: it now answers for a
+// `bbox`/`limit` window, and answers a bbox-less call with a globally spread
+// sample. The client therefore starts with a thin worldwide spread and grows
+// the catalog ADDITIVELY for whatever region the user settles on, piggybacking
+// the existing camera.moveEnd settle event (no new per-frame work).
+// ---------------------------------------------------------------------------
+
+/** Settle delay before a moveEnd triggers a viewport source fetch. */
+const VIEWPORT_REFETCH_DEBOUNCE_MS = 400;
+/** Cameras requested per viewport fetch (server clamps to its own 1..3000). */
+const VIEWPORT_FETCH_LIMIT = 600;
+/**
+ * Ceiling on the client-side catalog. Panning the globe would otherwise grow
+ * `_records` (and its billboards/entities) without bound; past this many
+ * cameras the furthest-from-view records are torn down (see
+ * enforceCatalogCeiling). Sized well above any single viewport fetch so a
+ * normal session never evicts, and well below the point where per-camera
+ * geometry work becomes visible.
+ */
+const CCTV_CATALOG_MAX = 2500;
+/**
+ * Hysteresis thresholds for "has the view meaningfully changed?". A refetch is
+ * worth a round trip only when the window moved by a real fraction of its own
+ * span, or when the span itself changed by this ratio (a zoom step). Small
+ * pans and nudges must never refetch — see cctvViewportChangedEnough.
+ */
+const VIEWPORT_MOVE_FRACTION = 0.35;
+const VIEWPORT_SPAN_RATIO = 1.5;
+/** Decimals kept in a serialized bbox (~1 m at the equator — plenty). */
+const VIEWPORT_BBOX_DECIMALS = 5;
 /** Default calibration offsets — all zeroed, range scale 1x. */
 const DEFAULT_CAMERA_CALIBRATION = Object.freeze({
   offsetNorthM: 0,
@@ -340,6 +374,33 @@ let _mapStackListener = null;
 // pass (removed in destroy). Event-driven only — never a per-frame loop, so
 // the zero-steady-state-work invariant holds.
 let _horizonCullListener = null;
+// Viewport-scoped catalog growth state. The debounce timer and the
+// single-flight latch are the only mutable scheduling state; cleared by
+// cancelViewportRefetch on disable/destroy so a settled moveEnd can never
+// fire a fetch into a torn-down viewer.
+let _viewportRefetchTimer = 0;
+let _viewportFetchInFlight = false;
+/**
+ * Bumped by cancelViewportRefetch. An in-flight fetch captures the value it
+ * started under and abandons its merge (and leaves the latch alone) if the
+ * generation has moved on, so a disable/enable or re-init during a request can
+ * never let a stale page land on a fresh catalog nor overlap two merges.
+ */
+let _viewportFetchGeneration = 0;
+/**
+ * Descriptor of the view the last SUCCESSFUL fetch covered:
+ *   undefined — never fetched (the first settle always fetches)
+ *   null      — that fetch was bbox-less (global sample)
+ *   object    — {centerLat, centerLon, latSpan, lonSpan}
+ * @type {{centerLat:number,centerLon:number,latSpan:number,lonSpan:number}|null|undefined}
+ */
+let _viewportLastFetchView;
+/**
+ * Next viewshed-hue index to hand out. Hue identity is an index into the
+ * id-SORTED catalog at init; merged arrivals continue AFTER the current
+ * maximum instead of re-sorting (see mergeViewportSources for why).
+ */
+let _hueIndexCursor = 0;
 // Ambient card tier state (2026-07-29 design). The card set is rebuilt only
 // on moveEnd/enable/activation (refreshAmbientCards); frame slots are STABLE
 // objects shared with the overlay host so landed frames appear without an
@@ -1088,18 +1149,114 @@ function cityIdByName(cityName) {
 }
 
 /**
- * Fetches configured camera sources from the backend.
- * @returns {Promise<Object[]>} Array of raw source objects, or empty on failure.
+ * Converts a Cesium view rectangle into the degree bbox `/api/cctv/sources`
+ * expects. PURE — no viewer, no scene queries (unit-tested directly).
+ *
+ * `camera.computeViewRectangle()` hands back a `Cesium.Rectangle` in RADIANS,
+ * and `undefined` whenever the view is not a resolvable globe rectangle (an
+ * oblique limb shot, a pose looking past the horizon). Returning null for that
+ * case is load-bearing: the caller must then omit `bbox` entirely so the
+ * server answers with its global sample rather than an empty window.
+ *
+ * Antimeridian: Cesium normalizes longitude to [-PI, PI] and encodes a box
+ * straddling 180° as `west > east`. The server uses the identical convention
+ * (`minLon > maxLon` ⇒ wraps the dateline), so the two bounds are passed
+ * through UNSORTED — ordering them here would silently invert a narrow Pacific
+ * window into the long way round the planet.
+ *
+ * @param {{west:number,south:number,east:number,north:number}|null|undefined} rectangle
+ *   View rectangle in radians (a Cesium.Rectangle, or any shape with the four fields).
+ * @returns {{minLat:number,minLon:number,maxLat:number,maxLon:number,wrapsDateline:boolean}|null}
+ *   Degree bbox, or null when no usable rectangle exists.
  */
-async function loadCameraSources() {
+export function cctvBboxFromViewRectangle(rectangle) {
+  const west = Number(rectangle?.west);
+  const south = Number(rectangle?.south);
+  const east = Number(rectangle?.east);
+  const north = Number(rectangle?.north);
+  if (![west, south, east, north].every((value) => Number.isFinite(value))) return null;
+  const minLat = clamp(Cesium.Math.toDegrees(south), -90, 90);
+  const maxLat = clamp(Cesium.Math.toDegrees(north), -90, 90);
+  // A degenerate or inverted latitude band is not a view the server can answer
+  // (it rejects minLat > maxLat), so fall back to the global sample.
+  if (!(maxLat >= minLat)) return null;
+  const minLon = clamp(Cesium.Math.toDegrees(west), -180, 180);
+  const maxLon = clamp(Cesium.Math.toDegrees(east), -180, 180);
+  return { minLat, minLon, maxLat, maxLon, wrapsDateline: minLon > maxLon };
+}
+
+/**
+ * Builds the `/api/cctv/sources` query string for a scoped fetch. PURE.
+ *
+ * Both parameters are optional and each is omitted when absent/unusable, which
+ * is exactly how the caller asks for the server's global sample: no bbox, no
+ * guessed world-rectangle. Commas are left unescaped — they are valid query
+ * sub-delimiters and the server splits the raw value on them.
+ *
+ * @param {Object} [options={}]
+ * @param {{minLat:number,minLon:number,maxLat:number,maxLon:number}|null} [options.bbox]
+ *   Degree bbox from cctvBboxFromViewRectangle, or null/omitted for global.
+ * @param {number|null} [options.limit] Requested max rows (server re-clamps).
+ * @returns {string} Query string beginning with '?', or '' when nothing applies.
+ */
+export function cctvSourceQueryString({ bbox = null, limit = null } = {}) {
+  const params = [];
+  const bounds = bbox
+    ? [bbox.minLat, bbox.minLon, bbox.maxLat, bbox.maxLon].map((value) => Number(value))
+    : null;
+  if (bounds && bounds.every((value) => Number.isFinite(value))) {
+    // Trim the float tail: radian→degree conversion yields 15 significant
+    // digits, and a kilometre-scale window gains nothing from sub-millimetre
+    // bounds while the noise would defeat any upstream response caching.
+    const rounded = bounds.map((value) => Number(value.toFixed(VIEWPORT_BBOX_DECIMALS)));
+    params.push(`bbox=${rounded.join(',')}`);
+  }
+  const limitValue = Number(limit);
+  if (Number.isFinite(limitValue) && limitValue >= 1) {
+    params.push(`limit=${Math.floor(limitValue)}`);
+  }
+  return params.length ? `?${params.join('&')}` : '';
+}
+
+/**
+ * Fetches configured camera sources from the backend.
+ *
+ * Called with no options this is the historical whole-layer request, which the
+ * server now answers with a globally spread SAMPLE of the registry (not the
+ * whole thing). Passing a bbox scopes the answer to one window so the viewport
+ * refetch path can grow the catalog where the user is actually looking.
+ *
+ * Failure behaviour is unchanged in substance — any transport/shape error
+ * yields an empty `sources` array and the caller proceeds on what it already
+ * has; the surrounding metadata is reported so callers can log coverage
+ * without a second request.
+ *
+ * @param {Object} [options={}] Scoping options, forwarded to cctvSourceQueryString.
+ * @param {{minLat:number,minLon:number,maxLat:number,maxLon:number}|null} [options.bbox]
+ * @param {number|null} [options.limit]
+ * @returns {Promise<{sources:Object[], total:number, matched:number, returned:number,
+ *   truncated:boolean, scope:string}>} Parsed body; `sources` is [] on any failure.
+ */
+async function loadCameraSources(options = {}) {
+  const failed = {
+    sources: [], total: 0, matched: 0, returned: 0, truncated: false, scope: 'error',
+  };
   try {
-    const resp = await fetch(SOURCE_ENDPOINT, { cache: 'no-store' });
-    if (!resp.ok) return [];
+    const resp = await fetch(`${SOURCE_ENDPOINT}${cctvSourceQueryString(options)}`, { cache: 'no-store' });
+    if (!resp.ok) return failed;
     const data = await resp.json();
-    if (!Array.isArray(data?.sources)) return [];
-    return data.sources;
+    if (!Array.isArray(data?.sources)) return failed;
+    return {
+      sources: data.sources,
+      total: safeNumber(data.total, data.sources.length),
+      matched: safeNumber(data.matched, data.sources.length),
+      returned: safeNumber(data.returned, data.sources.length),
+      truncated: !!data.truncated,
+      // A server without the scope field: infer it from what we asked for.
+      scope: typeof data.scope === 'string' ? data.scope : (options?.bbox ? 'viewport' : 'global-sample'),
+    };
   } catch {
-    return [];
+    return failed;
   }
 }
 
@@ -3972,7 +4129,12 @@ function clearRuntimeState() {
   stopGeometryLoadQueue();
   // Idempotent — also covers a re-init without a prior destroy().
   teardownAmbientCards();
+  cancelViewportRefetch();
   clearProjectionOverlay();
+  // Viewport growth state is catalog-scoped: a fresh catalog has fetched
+  // nothing and owns no hue indices yet.
+  _viewportLastFetchView = undefined;
+  _hueIndexCursor = 0;
   _records = [];
   _recordById = new Map();
   _healthById = new Map();
@@ -4154,6 +4316,519 @@ async function syncHealthState(force = false) {
 }
 
 // ---------------------------------------------------------------------------
+// Viewport-scoped catalog growth
+//
+// The registry is far larger than any one response, so the catalog is grown
+// ADDITIVELY for the region the user settles on. Everything here is driven off
+// the SAME camera.moveEnd settle event the horizon cull and ambient cards
+// already use — there is deliberately no per-frame listener, no polling timer,
+// and no steady-state work whatsoever when the camera is still.
+//
+// The policy decisions (is this view different enough to be worth a round
+// trip? which records go when the catalog is full?) are pure functions so they
+// can be unit-tested without a Cesium viewer; see cctvViewport.test.mjs.
+// ---------------------------------------------------------------------------
+
+/**
+ * Reduces a degree bbox to the centre/span descriptor the hysteresis test
+ * compares. PURE.
+ *
+ * The longitude span is computed the wrapped way round for a dateline-crossing
+ * box, so a window straddling 180° reports its true (small) span instead of
+ * the ~360° the raw subtraction would give.
+ *
+ * @param {{minLat:number,minLon:number,maxLat:number,maxLon:number}|null} bbox
+ * @returns {{centerLat:number,centerLon:number,latSpan:number,lonSpan:number}|null}
+ *   Descriptor, or null when there is no bbox (i.e. a global-sample fetch).
+ */
+export function cctvViewportDescriptor(bbox) {
+  if (!bbox) return null;
+  const minLat = Number(bbox.minLat);
+  const minLon = Number(bbox.minLon);
+  const maxLat = Number(bbox.maxLat);
+  const maxLon = Number(bbox.maxLon);
+  if (![minLat, minLon, maxLat, maxLon].every((value) => Number.isFinite(value))) return null;
+  const lonSpan = maxLon >= minLon ? (maxLon - minLon) : (maxLon - minLon + 360);
+  const centerLonRaw = minLon + lonSpan / 2;
+  return {
+    centerLat: (minLat + maxLat) / 2,
+    // Re-normalize into [-180, 180) so a wrapped box's centre stays a real
+    // longitude and the shortest-path delta below behaves.
+    centerLon: ((centerLonRaw + 540) % 360) - 180,
+    latSpan: maxLat - minLat,
+    lonSpan,
+  };
+}
+
+/**
+ * Hysteresis gate: has the view changed enough since the last SUCCESSFUL fetch
+ * to justify another round trip? PURE.
+ *
+ * Two independent triggers, either of which suffices:
+ *   1. the window centre moved by more than `moveFraction` of the CURRENT
+ *      window span (so the threshold scales with zoom — 35 % of a city view is
+ *      a few kilometres, 35 % of a continental view is hundreds);
+ *   2. the span itself changed by `spanRatio` in either direction (a genuine
+ *      zoom step, which changes what the server would select even from a
+ *      stationary centre).
+ *
+ * Small pans and nudges satisfy neither and are answered with `false`, which is
+ * the whole point: the catalog already covers them.
+ *
+ * @param {{centerLat:number,centerLon:number,latSpan:number,lonSpan:number}|null|undefined} last
+ *   Descriptor of the last successful fetch: `undefined` = never fetched (always
+ *   refetch), `null` = that fetch was the bbox-less global sample.
+ * @param {{centerLat:number,centerLon:number,latSpan:number,lonSpan:number}|null} next
+ *   Descriptor of the view now on screen (null = no resolvable rectangle).
+ * @param {Object} [thresholds={}]
+ * @param {number} [thresholds.moveFraction=VIEWPORT_MOVE_FRACTION]
+ * @param {number} [thresholds.spanRatio=VIEWPORT_SPAN_RATIO]
+ * @returns {boolean} True when a fetch is warranted.
+ */
+export function cctvViewportChangedEnough(last, next, thresholds = {}) {
+  const moveFraction = Number.isFinite(thresholds.moveFraction)
+    ? thresholds.moveFraction
+    : VIEWPORT_MOVE_FRACTION;
+  const spanRatio = Number.isFinite(thresholds.spanRatio)
+    ? thresholds.spanRatio
+    : VIEWPORT_SPAN_RATIO;
+  // Never fetched: the first settle always fetches.
+  if (last === undefined) return true;
+  // Global-sample transitions are scope changes, not movements: the server
+  // answers a bbox-less call with an entirely different selection, so crossing
+  // that boundary in either direction is always worth one fetch — while
+  // staying global (no resolvable rectangle two settles running) is not.
+  if (!last || !next) return Boolean(last) !== Boolean(next);
+
+  const lastLatSpan = Math.abs(last.latSpan);
+  const lastLonSpan = Math.abs(last.lonSpan);
+  const latSpan = Math.abs(next.latSpan);
+  const lonSpan = Math.abs(next.lonSpan);
+
+  // Span ratio, taken symmetrically so zooming in and out trip at the same
+  // factor. A zero/degenerate previous span can only be treated as changed.
+  const ratio = (a, b) => {
+    if (!(a > 0) || !(b > 0)) return a === b ? 1 : Infinity;
+    return Math.max(a / b, b / a);
+  };
+  if (ratio(latSpan, lastLatSpan) >= spanRatio) return true;
+  if (ratio(lonSpan, lastLonSpan) >= spanRatio) return true;
+
+  // Centre movement, measured against the current span. Longitude uses the
+  // shortest path so a pan across the antimeridian reads as a small move.
+  const latMove = Math.abs(next.centerLat - last.centerLat);
+  const lonDelta = Math.abs(next.centerLon - last.centerLon) % 360;
+  const lonMove = lonDelta > 180 ? 360 - lonDelta : lonDelta;
+  if (latSpan > 0 && latMove > moveFraction * latSpan) return true;
+  if (lonSpan > 0 && lonMove > moveFraction * lonSpan) return true;
+  return false;
+}
+
+/**
+ * Eviction exemption predicate. PURE.
+ *
+ * Three classes of camera must survive a catalog trim regardless of distance,
+ * because tearing them down would destroy visible, user-owned state:
+ *   - the ACTIVE camera (its monitor plane, probe clamp and projection runtime
+ *     are the user's current view);
+ *   - any camera currently holding an ambient card (its card would blink out
+ *     from under the pointer, and the hover pin counts as a card);
+ *   - any `poseSource === 'curated'` camera — hand-calibrated poses are scarce
+ *     and expensive, and re-fetching one does not restore its CAL provenance.
+ *
+ * @param {{id:string, poseSource?:string|null}} entry Catalog entry under test.
+ * @param {Object} [context={}]
+ * @param {string|null} [context.activeCameraId]
+ * @param {Set<string>|string[]} [context.cardIds] Ids currently showing a card.
+ * @returns {boolean} True when the entry must not be evicted.
+ */
+export function cctvEvictionExempt(entry, context = {}) {
+  const id = entry?.id;
+  if (!id) return true;
+  if (context.activeCameraId && id === context.activeCameraId) return true;
+  const cardIds = context.cardIds;
+  if (cardIds instanceof Set ? cardIds.has(id) : Array.isArray(cardIds) && cardIds.includes(id)) {
+    return true;
+  }
+  return entry?.poseSource === 'curated';
+}
+
+/**
+ * Plans which catalog entries to evict to get back under the ceiling. PURE.
+ *
+ * Furthest-from-the-view first: the cameras least likely to be looked at next
+ * are the cheapest to lose and the cheapest to re-fetch. Exempt entries are
+ * skipped entirely, so an over-ceiling catalog made mostly of exempt cameras
+ * simply stays over the ceiling rather than destroying live state — the
+ * exemptions are correctness constraints, the ceiling is a budget.
+ *
+ * Ties break on id so a stable catalog produces a stable plan.
+ *
+ * @param {Array<{id:string, distanceKm:number, poseSource?:string|null}>} entries
+ *   One entry per live catalog record, with its distance from the current view.
+ * @param {Object} [options={}]
+ * @param {number} [options.limit=CCTV_CATALOG_MAX] Target catalog size.
+ * @param {string|null} [options.activeCameraId]
+ * @param {Set<string>|string[]} [options.cardIds]
+ * @returns {string[]} Ids to evict, furthest-first (empty when none should go).
+ */
+export function planCctvCatalogEviction(entries, options = {}) {
+  const list = Array.isArray(entries) ? entries.filter((entry) => entry?.id) : [];
+  const limit = Number.isFinite(options.limit) ? options.limit : CCTV_CATALOG_MAX;
+  const overflow = list.length - Math.max(0, limit);
+  if (overflow <= 0) return [];
+  const evictable = list
+    .filter((entry) => !cctvEvictionExempt(entry, options))
+    .sort((a, b) => {
+      const delta = (Number(b.distanceKm) || 0) - (Number(a.distanceKm) || 0);
+      return delta !== 0 ? delta : String(a.id).localeCompare(String(b.id));
+    });
+  return evictable.slice(0, Math.min(overflow, evictable.length)).map((entry) => entry.id);
+}
+
+/**
+ * Builds one camera runtime record (billboard + state) and registers it in the
+ * live catalog. Shared verbatim by init() and the viewport merge so a merged
+ * camera can never be half-initialized relative to an init-time one.
+ *
+ * @param {Object} camera Fully-posed camera object (ensureCameraPose already run).
+ * @param {Object} [options={}]
+ * @param {{ellipsoid:number, source:string}|null} [options.groundPrior] Re:Earth
+ *   ellipsoidal ground prior, or null while/if the batch has not landed.
+ * @param {number} [options.hueIndex=0] Viewshed hue index (golden-angle input).
+ * @returns {Object|null} The registered record, or null without a billboard collection.
+ */
+function registerCameraRecord(camera, { groundPrior = null, hueIndex = 0 } = {}) {
+  if (!camera || !_billboards) return null;
+  // Cheap first-pass altitude from the ellipsoidal prior (catalog value
+  // only as the pre-prior fallback) — the staggered geometry queue
+  // refines with sampled tile heights after enable so the init path
+  // never raycasts the scene once per camera.
+  const priorGround = Number.isFinite(groundPrior?.ellipsoid)
+    ? groundPrior.ellipsoid
+    : (Number(camera.groundElevationM) || 0);
+  camera.absoluteHeightM = priorGround + camera.mountHeightM;
+  const position = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, camera.absoluteHeightM);
+  const billboard = _billboards.add({
+    id: camera.id,
+    image: CAMERA_ICON,
+    position,
+    color: IDLE_CAMERA_COLOR,
+    width: 24,
+    height: 24,
+    // Field-test fix (2026-07-06): always-on-top. The old finite value
+    // (1800 m) re-engaged the depth test at far zoom, where the COARSE
+    // far-LOD Google-3D mesh sits above the true ground and swallowed
+    // ground-anchored icons ("submerged" pills over SF). Far-side-of-globe
+    // icons are handled by refreshHorizonCulling() (the flights-layer
+    // EllipsoidalOccluder pattern), not by the depth test.
+    disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    scaleByDistance: new Cesium.NearFarScalar(350, 1.25, 4_000_000, 0.42),
+  });
+
+  const record = {
+    camera,
+    position,
+    billboard,
+    coverageEntities: [],
+    projection: null,
+    // Task 5 (height-datum fix): regime-aware ground resolution state.
+    //   groundPrior     — { ellipsoid, source } from the Re:Earth batch
+    //     (null until a late batch lands). The prior applies in EVERY
+    //     regime and is the terrain-globe resolution outright.
+    //   groundResolved  — PER-REGIME one-shot latch (regime key →
+    //     boolean): true once this record's resolution completed for that
+    //     regime; such records are excluded from the completion pass so
+    //     their geometry freezes. Re-armed only on a genuine pose change,
+    //     explicit user select/move, or a surface-regime change — never
+    //     on the 10s timer.
+    //   groundSamples   — PER-REGIME resolved ground (regime key →
+    //     metres): the accepted one-shot scene sample in google-3d, the
+    //     mirrored prior in terrain-globe. Kept across re-arms as the
+    //     "has ever resolved" memory for the B9c mid-stream guard.
+    //   frustumPositions — cached Cartesians for pure recomputes (so
+    //     plane placement never re-derives geometry it already has).
+    groundPrior,
+    groundResolved: {},
+    groundSamples: {},
+    frustumGeometry: null,
+    frustumPositions: null,
+    // §9.1 activation obstruction probe result: effective-range clamp so
+    // the far-cap plane never clips into the tiles. Null = unclamped.
+    // Reset + re-probed on every activation; cleared when the user takes
+    // the range slider (slider overrides the clamp).
+    probeClampRangeM: null,
+    // Viewshed (design §3a/§3b): per-camera color identity + the volume
+    // primitive handle (exists only in viewshed mode for the visible set).
+    viewshedColors: viewshedColors(cameraHue(hueIndex)),
+    viewshedPrimitive: null,
+    viewshedActiveTint: false,
+  };
+  _records.push(record);
+  _recordById.set(camera.id, record);
+  return record;
+}
+
+/**
+ * Tears a single record out of the live catalog and the scene: viewshed
+ * volume, coverage polylines, projection runtime, billboard, queue membership
+ * and card bookkeeping. Mirrors destroyCoverageEntities()/teardownAmbientCards()
+ * for one record so eviction cannot leak primitives or entities.
+ *
+ * @param {Object} record Record to destroy (must already be in _recordById).
+ * @returns {void}
+ */
+function destroyCameraRecord(record) {
+  if (!record) return;
+  const id = record.camera?.id;
+  destroyViewshedVolume(record);
+  for (const entity of record.coverageEntities || []) {
+    if (_viewer && !_viewer.isDestroyed?.()) _viewer.entities.remove(entity);
+    const index = _coverageEntities.indexOf(entity);
+    if (index >= 0) _coverageEntities.splice(index, 1);
+  }
+  record.coverageEntities = [];
+  if (record.projection) {
+    const runtime = record.projection;
+    destroyProjectionRuntime(runtime);
+    const index = _projectionEntities.indexOf(runtime);
+    if (index >= 0) _projectionEntities.splice(index, 1);
+    record.projection = null;
+  }
+  if (record.billboard && _billboards && !_billboards.isDestroyed?.()) {
+    _billboards.remove(record.billboard);
+  }
+  record.billboard = null;
+  // Drop any pending geometry work for a record that no longer exists.
+  const queued = _geoQueue.indexOf(record);
+  if (queued >= 0) _geoQueue.splice(queued, 1);
+  if (id) {
+    _recordById.delete(id);
+    _cardIds.delete(id);
+    _cardGraceState.delete(id);
+    _cardFrameSlots.delete(id);
+    _healthById.delete(id);
+    if (_hoverCardId === id) clearHoverCard();
+  }
+  const index = _records.indexOf(record);
+  if (index >= 0) _records.splice(index, 1);
+}
+
+/**
+ * Trims the catalog back to CCTV_CATALOG_MAX after a merge, evicting the
+ * records furthest from the current view (see planCctvCatalogEviction for the
+ * policy and its exemptions).
+ *
+ * @param {{centerLat:number, centerLon:number}|null} viewCenter Centre of the
+ *   current view rectangle; falls back to the viewer's own ground position.
+ * @returns {number} Number of records evicted.
+ */
+function enforceCatalogCeiling(viewCenter) {
+  if (_records.length <= CCTV_CATALOG_MAX) return 0;
+  const carto = _viewer?.camera?.positionCartographic;
+  const refLat = Number.isFinite(viewCenter?.centerLat)
+    ? viewCenter.centerLat
+    : (carto ? Cesium.Math.toDegrees(carto.latitude) : 0);
+  const refLon = Number.isFinite(viewCenter?.centerLon)
+    ? viewCenter.centerLon
+    : (carto ? Cesium.Math.toDegrees(carto.longitude) : 0);
+  // The hover pin is a card for exemption purposes — it is on screen.
+  const cardIds = new Set(_cardIds);
+  if (_hoverCardId) cardIds.add(_hoverCardId);
+  const doomed = planCctvCatalogEviction(
+    _records.map((record) => ({
+      id: record.camera.id,
+      poseSource: record.camera.poseSource,
+      distanceKm: haversineKm(refLat, refLon, record.camera.lat, record.camera.lon),
+    })),
+    { limit: CCTV_CATALOG_MAX, activeCameraId: _activeCameraId, cardIds },
+  );
+  for (const id of doomed) destroyCameraRecord(_recordById.get(id));
+  return doomed.length;
+}
+
+/**
+ * Merges a freshly fetched source page into the live catalog, ADDITIVELY.
+ *
+ * Only genuinely new ids are built; an id already in `_recordById` is skipped
+ * outright — never re-posed, re-billboarded or moved, because the user may have
+ * calibrated it, activated it, or simply be looking at it.
+ *
+ * @param {Object[]} rawSources Raw source rows from /api/cctv/sources.
+ * @param {{centerLat:number, centerLon:number}|null} [viewCenter=null] Current
+ *   view centre, used only to aim eviction when the ceiling is hit.
+ * @returns {{added:number, evicted:number}} Merge outcome.
+ */
+function mergeViewportSources(rawSources, viewCenter = null) {
+  const incoming = Array.isArray(rawSources) ? rawSources : [];
+  const fresh = incoming.filter((source) => {
+    const id = typeof source?.id === 'string' ? source.id.trim() : String(source?.id || '').trim();
+    return id && !_recordById.has(id);
+  });
+  if (!fresh.length) return { added: 0, evicted: 0 };
+
+  // Re-check against the live catalog after the build (buildCatalogFromSources
+  // can drop rows, and a page could in principle repeat an id) so no existing
+  // record is ever shadowed by a second entry under the same id.
+  const seen = new Set();
+  const catalog = buildCatalogFromSources(fresh).filter((camera) => {
+    if (_recordById.has(camera.id) || seen.has(camera.id)) return false;
+    seen.add(camera.id);
+    return true;
+  });
+  if (!catalog.length) return { added: 0, evicted: 0 };
+
+  // Same per-camera preparation init() performs: restore any saved calibration
+  // (so a previously calibrated camera returns calibrated, with its CAL
+  // provenance) and re-pose with it applied.
+  for (const camera of catalog) {
+    const savedEntry = _calibrationById.get(camera.id);
+    if (savedEntry) {
+      camera.calibration = normalizeCalibration(savedEntry.values);
+      camera.calSource = savedEntry.source;
+    }
+    ensureCameraPose(camera);
+  }
+
+  // Hue assignment: init derives each camera's viewshed hue from its index in
+  // the id-SORTED catalog. Re-sorting on every merge would renumber — and so
+  // RECOLOR — cameras already placed on the globe, which is a far worse defect
+  // than imperfect hue separation: a user watching a coloured cone must not see
+  // it change colour because cameras arrived elsewhere in the world. New
+  // arrivals therefore continue the golden-angle sequence after the current
+  // maximum index. The golden angle keeps consecutive indices well separated,
+  // so the practical cost is only that a new camera's hue is not maximally
+  // distant from its own geographic neighbours' — deliberately accepted.
+  const newRecords = [];
+  for (const camera of catalog) {
+    const record = registerCameraRecord(camera, {
+      groundPrior: null,
+      hueIndex: _hueIndexCursor++,
+    });
+    if (record) newRecords.push(record);
+  }
+  if (!newRecords.length) return { added: 0, evicted: 0 };
+
+  // Ground priors for the new subset only, applied post-hoc through the same
+  // late-batch path init uses when it loses its bounded race. Merged cameras
+  // never get a blocking wait — the staggered geometry queue below already
+  // draws them from the catalog fallback, and applyLateGroundPriors is guarded
+  // by record identity, so a batch landing after an eviction or re-init no-ops.
+  resolveGroundPriors(catalog)
+    .then((priors) => { if (priors) applyLateGroundPriors(newRecords, priors); })
+    .catch(() => {});
+
+  // Geometry for the new subset through the existing stagger machinery — the
+  // merge itself never raycasts and never touches an existing record.
+  enqueueGeometryRefresh(newRecords);
+
+  const evicted = enforceCatalogCeiling(viewCenter);
+  _count = _records.length;
+
+  // Re-run the same event-driven passes a settle performs, now that the
+  // catalog has new members: horizon visibility for the new billboards,
+  // billboard/coverage styling, and ambient card reselection. Existing records
+  // are idempotent under all three.
+  refreshHorizonCulling();
+  refreshCoverageStyles();
+  refreshAmbientCards();
+  restoreSpriteOrder(_viewer);
+  notifyListeners();
+  return { added: newRecords.length, evicted };
+}
+
+/**
+ * Cancels any pending/settled viewport refetch work. Called from disable() and
+ * destroy() so a debounce already in flight cannot fire a fetch — or a merge —
+ * into a disabled layer or a torn-down viewer.
+ * @returns {void}
+ */
+function cancelViewportRefetch() {
+  if (_viewportRefetchTimer) {
+    clearTimeout(_viewportRefetchTimer);
+    _viewportRefetchTimer = 0;
+  }
+  // Retire any request already on the wire and release the latch, so a later
+  // enable is never wedged shut waiting on a response nobody wants. The
+  // generation bump is what keeps that release from allowing two overlapping
+  // merges: the abandoned request can no longer merge or clear the latch.
+  _viewportFetchGeneration += 1;
+  _viewportFetchInFlight = false;
+}
+
+/**
+ * Fetches and merges sources for the current view. Single-flight: a second
+ * call while one is in flight is dropped rather than queued, because the next
+ * moveEnd will schedule a fresh one against a newer view anyway.
+ * @returns {Promise<void>}
+ */
+async function runViewportRefetch() {
+  if (!_enabled || !_viewer || _viewer.isDestroyed() || !_billboards) return;
+  if (_viewportFetchInFlight) return;
+
+  // computeViewRectangle() returns undefined whenever the view is not a
+  // resolvable globe rectangle; cctvBboxFromViewRectangle turns that into null
+  // and the request then carries no bbox at all, so the server replies with its
+  // global sample instead of us inventing a world rectangle.
+  let rectangle;
+  try {
+    rectangle = _viewer.camera.computeViewRectangle();
+  } catch {
+    rectangle = undefined;
+  }
+  const bbox = cctvBboxFromViewRectangle(rectangle);
+  const descriptor = cctvViewportDescriptor(bbox);
+  if (!cctvViewportChangedEnough(_viewportLastFetchView, descriptor)) return;
+
+  const generation = _viewportFetchGeneration;
+  _viewportFetchInFlight = true;
+  try {
+    const page = await loadCameraSources({ bbox, limit: VIEWPORT_FETCH_LIMIT });
+    // Re-check after the await: the layer may have been disabled, the viewer
+    // destroyed, or the catalog re-inited while the request was outstanding.
+    if (generation !== _viewportFetchGeneration) return;
+    if (!_enabled || !_viewer || _viewer.isDestroyed() || !_billboards) return;
+    if (!page.sources.length) {
+      // An empty answer for a genuinely empty region is still an answer: record
+      // the view so a stationary camera over the Pacific does not refetch on
+      // every settle. A transport failure reports scope 'error' and is NOT
+      // recorded, so it retries on the next settle.
+      if (page.scope !== 'error') _viewportLastFetchView = descriptor;
+      return;
+    }
+    const { added, evicted } = mergeViewportSources(page.sources, descriptor);
+    _viewportLastFetchView = descriptor;
+    if (added || evicted) {
+      console.log(
+        `[Data:CCTV] viewport merge +${added} -${evicted} (catalog ${_count}, scope ${page.scope}, matched ${page.matched})`
+      );
+    }
+  } catch (error) {
+    // loadCameraSources already swallows transport errors; this guards the
+    // merge/geometry path so one bad page can never kill the settle listener.
+    console.warn('[Data:CCTV] viewport refetch failed:', error?.message || error);
+  } finally {
+    // A retired request must not clear a latch that now belongs to a newer one.
+    if (generation === _viewportFetchGeneration) _viewportFetchInFlight = false;
+  }
+}
+
+/**
+ * Debounced entry point, invoked from the camera.moveEnd settle handler. The
+ * delay absorbs the burst of settles a flyTo or a flick-pan produces so only
+ * the view the user actually stopped on is fetched.
+ * @returns {void}
+ */
+function scheduleViewportRefetch() {
+  if (!_enabled || !_viewer || _viewer.isDestroyed()) return;
+  if (_viewportRefetchTimer) clearTimeout(_viewportRefetchTimer);
+  _viewportRefetchTimer = setTimeout(() => {
+    _viewportRefetchTimer = 0;
+    runViewportRefetch().catch(() => {});
+  }, VIEWPORT_REFETCH_DEBOUNCE_MS);
+}
+
+// ---------------------------------------------------------------------------
 // Exported layer object — standard layer interface + CCTV-specific methods
 // ---------------------------------------------------------------------------
 
@@ -4189,9 +4864,14 @@ const cctvLayer = {
     _viewer.scene.primitives.add(_billboards);
     registerSpriteCollection('cctv', _billboards);
 
-    const sources = await loadCameraSources();
-    const catalogFromSources = buildCatalogFromSources(sources);
+    // First load is deliberately bbox-less: at init the Cesium camera has not
+    // settled on a region yet, so the server's globally spread sample is the
+    // honest answer. The moveEnd-driven viewport refetch grows the catalog
+    // additively once the user actually looks somewhere.
+    const sourcePage = await loadCameraSources({ limit: VIEWPORT_FETCH_LIMIT });
+    const catalogFromSources = buildCatalogFromSources(sourcePage.sources);
     const catalog = catalogFromSources.length ? catalogFromSources : seedCatalog();
+    _viewportLastFetchView = catalogFromSources.length ? null : undefined;
 
     // Viewshed color identity (design §3a): golden-angle hue over the
     // id-SORTED catalog index — deterministic across sessions for a stable
@@ -4223,78 +4903,18 @@ const cctvLayer = {
     ]);
 
     for (let i = 0; i < catalog.length; i++) {
-      const camera = catalog[i];
       // Ellipsoidal ground prior (or null while the batch is still in
       // flight). Geometry falls back to the catalog value only until the
       // batch lands.
-      const groundPrior = priors?.[i] || null;
-      // Cheap first-pass altitude from the ellipsoidal prior (catalog value
-      // only as the pre-prior fallback) — the staggered geometry queue
-      // refines with sampled tile heights after enable so the init path
-      // never raycasts the scene once per camera.
-      const priorGround = Number.isFinite(groundPrior?.ellipsoid)
-        ? groundPrior.ellipsoid
-        : (Number(camera.groundElevationM) || 0);
-      camera.absoluteHeightM = priorGround + camera.mountHeightM;
-      const position = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, camera.absoluteHeightM);
-      const billboard = _billboards.add({
-        id: camera.id,
-        image: CAMERA_ICON,
-        position,
-        color: IDLE_CAMERA_COLOR,
-        width: 24,
-        height: 24,
-        // Field-test fix (2026-07-06): always-on-top. The old finite value
-        // (1800 m) re-engaged the depth test at far zoom, where the COARSE
-        // far-LOD Google-3D mesh sits above the true ground and swallowed
-        // ground-anchored icons ("submerged" pills over SF). Far-side-of-globe
-        // icons are handled by refreshHorizonCulling() (the flights-layer
-        // EllipsoidalOccluder pattern), not by the depth test.
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
-        scaleByDistance: new Cesium.NearFarScalar(350, 1.25, 4_000_000, 0.42),
+      registerCameraRecord(catalog[i], {
+        groundPrior: priors?.[i] || null,
+        hueIndex: hueIndexById.get(catalog[i].id) ?? 0,
       });
-
-      const record = {
-        camera,
-        position,
-        billboard,
-        coverageEntities: [],
-        projection: null,
-        // Task 5 (height-datum fix): regime-aware ground resolution state.
-        //   groundPrior     — { ellipsoid, source } from the Re:Earth batch
-        //     (null until a late batch lands). The prior applies in EVERY
-        //     regime and is the terrain-globe resolution outright.
-        //   groundResolved  — PER-REGIME one-shot latch (regime key →
-        //     boolean): true once this record's resolution completed for that
-        //     regime; such records are excluded from the completion pass so
-        //     their geometry freezes. Re-armed only on a genuine pose change,
-        //     explicit user select/move, or a surface-regime change — never
-        //     on the 10s timer.
-        //   groundSamples   — PER-REGIME resolved ground (regime key →
-        //     metres): the accepted one-shot scene sample in google-3d, the
-        //     mirrored prior in terrain-globe. Kept across re-arms as the
-        //     "has ever resolved" memory for the B9c mid-stream guard.
-        //   frustumPositions — cached Cartesians for pure recomputes (so
-        //     plane placement never re-derives geometry it already has).
-        groundPrior,
-        groundResolved: {},
-        groundSamples: {},
-        frustumGeometry: null,
-        frustumPositions: null,
-        // §9.1 activation obstruction probe result: effective-range clamp so
-        // the far-cap plane never clips into the tiles. Null = unclamped.
-        // Reset + re-probed on every activation; cleared when the user takes
-        // the range slider (slider overrides the clamp).
-        probeClampRangeM: null,
-        // Viewshed (design §3a/§3b): per-camera color identity + the volume
-        // primitive handle (exists only in viewshed mode for the visible set).
-        viewshedColors: viewshedColors(cameraHue(hueIndexById.get(camera.id) ?? 0)),
-        viewshedPrimitive: null,
-        viewshedActiveTint: false,
-      };
-      _records.push(record);
-      _recordById.set(camera.id, record);
     }
+    // Hue identity is an index into the id-SORTED catalog, so the next free
+    // index is simply the catalog length. Viewport-merged arrivals continue
+    // from here instead of re-sorting (see mergeViewportSources).
+    _hueIndexCursor = catalog.length;
 
     _count = _records.length;
     if (_records.length > 0) {
@@ -4331,10 +4951,13 @@ const cctvLayer = {
       // Ambient cards piggyback the same settle event: moveEnd-driven
       // reselection only, never per frame (refreshAmbientCards no-ops while
       // the layer is disabled).
+      // Viewport source growth rides the SAME settle event (debounced inside
+      // scheduleViewportRefetch) — deliberately not a per-frame listener.
       _horizonCullListener = () => {
         _cameraMoving = false;
         refreshHorizonCulling();
         refreshAmbientCards();
+        scheduleViewportRefetch();
       };
       _viewer.camera.moveEnd.addEventListener(_horizonCullListener);
     }
@@ -4435,6 +5058,11 @@ const cctvLayer = {
     _cctvOverlayHost.setVisible(CCTV_OVERLAY_SOURCE_ID, true);
     startCardFrameLoop();
     refreshAmbientCards();
+    // The camera may already be parked over a region the catalog only holds a
+    // sparse global sample of, and no moveEnd is coming while it sits still —
+    // so schedule one scoped fetch now. The hysteresis gate makes this a no-op
+    // when the current view was already fetched (a disable/enable toggle).
+    scheduleViewportRefetch();
     notifyListeners();
     restoreSpriteOrder(_viewer);
   },
@@ -4451,6 +5079,8 @@ const cctvLayer = {
     _removeFocusAppearListener = null;
     stopProjectionLoop();
     stopGeometryLoadQueue();
+    // A settled moveEnd must not fetch or merge into a disabled layer.
+    cancelViewportRefetch();
     // Ambient cards tear down COMPLETELY on disable (owner design point 6):
     // source entries, pacer timer, in-flight handlers, and caches.
     teardownAmbientCards();
@@ -4525,6 +5155,7 @@ const cctvLayer = {
     }
     stopProjectionLoop();
     stopGeometryLoadQueue();
+    cancelViewportRefetch();
     teardownAmbientCards();
     destroyCoverageEntities();
     if (_billboards && teardownViewer) {
