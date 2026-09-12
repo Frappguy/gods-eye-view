@@ -32,6 +32,10 @@ DOMAIN="${GEV_DOMAIN:-eye.dinoclyde.com}"
 # Cold Cesium builds are slow. Budget generously; we poll often and report.
 HEALTH_TIMEOUT="${GEV_HEALTH_TIMEOUT:-600}"
 HEALTH_INTERVAL="${GEV_HEALTH_INTERVAL:-5}"
+# Separate budget for the API assertions. Serving / only needs the process up;
+# answering /api/cctv/sources needs the camera registry built, which is a much
+# slower and entirely different thing (see api_first_char).
+API_TIMEOUT="${GEV_API_TIMEOUT:-420}"
 OVERRIDE_FILE="docker-compose.override.yml"
 
 # ─── pretty output ────────────────────────────────────────────────────────────
@@ -363,20 +367,46 @@ ok "$BASE/ is serving"
 # Serving HTML is not enough. Under a bare `vite preview` the dev-only API
 # middleware is dropped and every /api route silently returns the SPA shell
 # instead of JSON — a 200 that lies. Assert real JSON on two of them.
-first_char() { curl -fsS --max-time 20 "$1" 2>/dev/null | tr -d '[:space:]' | cut -c1; }
+# The FIRST /api/cctv/sources call builds the camera registry, and since the
+# world catalogs landed that means fetching 35 upstream catalogs before it can
+# answer anything. On a cold container that runs well past any single curl
+# timeout — observed in a real ZimaOS deploy still streaming "[CCTV] world/..."
+# lines long after a 20s one-shot curl had already given up. The old check read
+# that empty body as a dead API and failed a deploy whose container was merely
+# still warming up. So: poll until it answers, and say so while waiting.
+#
+# A non-empty body ends the wait immediately, including an HTML one — HTML
+# means the route is not mounted at all, which more waiting cannot fix.
+api_first_char() {
+  local url="$1" deadline c
+  deadline=$(( $(date +%s) + API_TIMEOUT ))
+  while :; do
+    c="$(curl -fsS --max-time 30 "$url" 2>/dev/null | tr -d '[:space:]' | cut -c1)"
+    if [ -n "$c" ]; then printf '%s' "$c"; return 0; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then return 1; fi
+    printf '\r%s  · warming the camera registry (35 world catalogs)… %ss left%s ' \
+      "$C_DIM" "$(( deadline - $(date +%s) ))" "$C_RESET"
+    sleep "$HEALTH_INTERVAL"
+  done
+}
+first_char() { api_first_char "$1"; }
 
 for ep in /api/cctv/sources /api/radio/stations; do
   c="$(first_char "$BASE$ep" || true)"
   case "$c" in
-    '{'|'[') ok "$ep returns JSON" ;;
+    '{'|'[') printf '\r%*s\r' 70 ''; ok "$ep returns JSON" ;;
     '<') warn "$ep returned HTML, not JSON."
          warn "That means the API middleware is NOT mounted — the container is"
          warn "running a bare 'vite preview' instead of server/production-server.mjs."
          warn "The map will load and every live layer will be silently dead."
          docker logs --tail 50 "$CONTAINER_NAME" 2>&1 || true
          die "API layer not live" ;;
-    '')  docker logs --tail 50 "$CONTAINER_NAME" 2>&1 || true
-         die "$ep returned nothing (connection failed or empty body)" ;;
+    '')  printf '\r%*s\r' 70 ''
+         docker logs --tail 50 "$CONTAINER_NAME" 2>&1 || true
+         die "$ep still had not answered after ${API_TIMEOUT}s.
+     If the log above is still printing [CCTV] lines the registry was simply
+     slower than the budget — raise it and re-run:
+       GEV_API_TIMEOUT=900 sudo $0" ;;
     *)   die "$ep returned an unexpected body starting with '$c' (expected JSON)" ;;
   esac
 done
