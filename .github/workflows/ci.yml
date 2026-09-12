@@ -4,6 +4,23 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Manual trigger: Actions tab -> CI -> "Run workflow".
+  #
+  # Without this there is no way to start CI on a commit that has no run yet.
+  # The Actions UI only offers to RE-run runs that already exist, so a commit
+  # that predates Actions being enabled on a fork — or any commit whose run was
+  # never created — is unreachable, and the only remaining levers are pushing
+  # another commit or reopening the PR. This closes that gap permanently.
+  #
+  # Scope note, because registration and execution are separate steps and it is
+  # easy to state this wrongly. GitHub registers a workflow by its PATH on the
+  # default branch, but a dispatch then runs the copy of the file on whichever
+  # ref you target. So a REST dispatch against a topic branch works as soon as
+  # the path exists on main — even while main's own copy still lacks this
+  # trigger, which is exactly how this trigger was first exercised. What does
+  # wait for main is the "Run workflow" button in the Actions UI: it reads the
+  # default branch's copy to decide whether to show itself at all.
+  workflow_dispatch:
 
 permissions:
   contents: read
